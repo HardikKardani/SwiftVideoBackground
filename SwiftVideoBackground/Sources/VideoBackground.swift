@@ -9,11 +9,34 @@
 import AVFoundation
 import UIKit
 
+public enum State: String, CustomStringConvertible {
+    case buffering
+    case failed
+    case initialization
+    case loaded
+    case loading
+    case paused
+    case playing
+    case stopped
+    case waitingForNetwork
+    
+    public var description: String {
+        switch self {
+        case .waitingForNetwork:
+            return "Waiting For Network"
+        default:
+            return rawValue.capitalized
+        }
+    }
+}
+
 /// Class that plays and manages control of a video on a `UIView`.
 public class VideoBackground {
     /// Singleton that can play one video on one `UIView` at a time.
     public static let shared = VideoBackground()
 
+    public weak var delegate:VideoBackground?
+    
     /// Change this `CGFloat` to adjust the darkness of the video. Value `0` to `1`. Higher numbers are darker. Setting
     /// to an invalid value does nothing.
     public var darkness: CGFloat = 0 {
@@ -27,16 +50,23 @@ public class VideoBackground {
     /// Change this `Bool` to mute/unmute the video.
     public var isMuted = true {
         didSet {
-            playerLayer.player?.isMuted = isMuted
+//            playerLayer.player?.isMuted = isMuted
+            player.isMuted = isMuted
         }
     }
 
     /// Change this `Bool` to set whether the video restarts when it ends.
     public var willLoopVideo = true
 
+    public var videoWillFinishedPlaying:(()->())? = nil
+    
+//    public var playerStatus:((State) -> ())? = nil
+    
+//    public var playerItemPlayed:(()->())? = nil
+    
     /// Default is `.resizeAspectFill`. Change to `.resizeAspect` (doesn't fill view)
     /// or `.resize` (doesn't conserve aspect ratio)
-    public var videoGravity: AVLayerVideoGravity = .resizeAspectFill
+    public var videoGravity: AVLayerVideoGravity = .resizeAspectFill //.resizeAspect
 
     /// The `AVPlayerLayer` that can be accessed for advanced customization.
     public lazy var playerLayer = AVPlayerLayer(player: player)
@@ -50,9 +80,18 @@ public class VideoBackground {
     private var applicationWillEnterForegroundObserver: NSObjectProtocol?
 
     private var playerItemDidPlayToEndObserver: NSObjectProtocol?
+    
+//    private var playerItemDidPlay: NSKeyValueObservation?
 
     private var viewBoundsObserver: NSKeyValueObservation?
-
+    private var audioQueueObserver:NSKeyValueObservation?
+    private var audioQueueStatusObserver:NSKeyValueObservation?
+    private var audioQueueBufferEmptyObserver:NSKeyValueObservation?
+    private var audioQueueBufferAlmostThereObserver:NSKeyValueObservation?
+    private var audioQueueBufferFullObserver:NSKeyValueObservation?
+    private var audioQueueStallObserver:NSKeyValueObservation?
+    private var audioQueueWaitingObserver:NSKeyValueObservation?
+    
     /// You only need to initialize your own instance of `VideoBackground` if you are playing multiple videos on
     /// multiple `UIViews`. Otherwise just use the `shared` singleton.
     public init() {
@@ -61,7 +100,7 @@ public class VideoBackground {
             forName: UIApplication.willEnterForegroundNotification,
             object: nil,
             queue: .main) { [weak self] _ in
-                self?.playerLayer.player?.play()
+//                self?.playerLayer.player?.play()
         }
     }
 
@@ -88,7 +127,7 @@ public class VideoBackground {
                      isMuted: Bool = true,
                      darkness: CGFloat = 0,
                      willLoopVideo: Bool = true,
-                     setAudioSessionAmbient: Bool = true,
+                     setAudioSessionAmbient: Bool = false,
                      preventsDisplaySleepDuringVideoPlayback: Bool = true) throws {
         guard let path = Bundle.main.path(forResource: videoName, ofType: videoType) else {
             throw VideoBackgroundError.videoNotFound((name: videoName, type: videoType))
@@ -126,9 +165,10 @@ public class VideoBackground {
                      darkness: CGFloat = 0,
                      isMuted: Bool = true,
                      willLoopVideo: Bool = true,
-                     setAudioSessionAmbient: Bool = true,
+                     setAudioSessionAmbient: Bool = false,
                      preventsDisplaySleepDuringVideoPlayback: Bool = true) {
         cleanUp()
+        
 
         if setAudioSessionAmbient {
             if #available(iOS 10.0, *) {
@@ -146,9 +186,8 @@ public class VideoBackground {
         self.willLoopVideo = willLoopVideo
 
         if cache[url] == nil {
-            cache[url] = AVPlayerItem(url: url)
         }
-
+        cache[url] = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: cache[url])
         player.actionAtItemEnd = .none
         player.isMuted = isMuted
@@ -176,13 +215,106 @@ public class VideoBackground {
                 if let willLoopVideo = self?.willLoopVideo, willLoopVideo {
                     self?.restart()
                 }
+            
+            if let _ = self?.videoWillFinishedPlaying{
+                self?.videoWillFinishedPlaying?()
+            }
         }
+        
+//        playerItemDidPlay = cache[url]?.observe(\.status, options:  [.new], changeHandler: { (playerItem, change) in
+//            print("\(change.newValue)")
+//            if playerItem.status == .readyToPlay {
+//                self.playerItemPlayed?()
+//                print("play video")
+//            }
+//        })
+        
 
         // Adjust frames upon device rotation
         viewBoundsObserver = view.layer.observe(\.bounds) { [weak self] view, _ in
             DispatchQueue.main.async {
                 self?.playerLayer.frame = view.bounds
             }
+        }
+        
+        // listening for current item change
+        self.audioQueueObserver = self.player.observe(\.currentItem, options: [.new]) {
+            [weak self] (player, _) in
+            print("media item changed...")
+        }
+
+        // listening for current item status change
+        self.audioQueueStatusObserver = self.player.currentItem?.observe(\.status, options:  [.new, .old], changeHandler: {
+            (playerItem, change) in
+            switch playerItem.status{
+            case .unknown:
+                print("current item status is unknown")
+            case .readyToPlay:
+                print("current item status is ready")
+//                self.playerStatus?(.loaded)
+            case .failed:
+                print("current item status is failed with error:- \(playerItem.error?.localizedDescription)")
+            @unknown default:return
+            }
+        })
+
+        // listening for buffer is empty
+        self.audioQueueBufferEmptyObserver = self.player.currentItem?.observe(\.isPlaybackBufferEmpty, options: [.new]) {
+            [weak self] (_, _) in
+            print("buffering...")
+//            self?.playerStatus?(.buffering)
+        }
+        // listening for event that buffer is almost full
+        self.audioQueueBufferAlmostThereObserver = self.player.currentItem?.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) {
+            [weak self] (_, _) in
+            print("buffering ends...")
+        }
+
+        // listening for event that buffer is full
+        self.audioQueueBufferFullObserver = self.player.currentItem?.observe(\.isPlaybackBufferFull, options: [.new]) {
+            [weak self] (_, _) in
+            print("buffering is hidden...")
+        }
+
+        // listening for event about the status of the playback
+        if #available(iOS 10.0, *) {
+            self.audioQueueStallObserver = self.player.observe(\.timeControlStatus, options: [.new, .old], changeHandler: {
+                [weak self] (playerItem, change) in
+                if #available(iOS 10.0, *) {
+                    switch (playerItem.timeControlStatus) {
+                    case AVPlayer.TimeControlStatus.paused:
+                        print("Media Paused")
+                        //                    self?.playerStatus?(.paused)
+                    case AVPlayer.TimeControlStatus.playing:
+                        print("Media Playing")
+                        //                    self?.playerStatus?(.playing)
+                    case AVPlayer.TimeControlStatus.waitingToPlayAtSpecifiedRate:
+                        print("Media Waiting to play at specific rate!")
+                    @unknown default:
+                        return
+                    }
+                }
+                else {
+                    // Fallback on earlier versions
+                }
+            })
+        } else {
+            // Fallback on earlier versions
+        }
+
+        // listening for change event when player stops playback
+        if #available(iOS 10.0, *) {
+            self.audioQueueWaitingObserver = self.player.observe(\.reasonForWaitingToPlay, options: [.new, .old], changeHandler: {
+                (playerItem, change) in
+                if #available(iOS 10.0, *) {
+                    print("REASON FOR WAITING TO PLAY: ", playerItem.reasonForWaitingToPlay?.rawValue as Any)
+                }
+                else {
+                    // Fallback on earlier versions
+                }
+            })
+        } else {
+            // Fallback on earlier versions
         }
     }
 
@@ -202,6 +334,11 @@ public class VideoBackground {
         playerLayer.player?.play()
     }
 
+    public func reset() {
+        playerLayer.player?.seek(to: CMTime.zero)
+        self.pause()
+    }
+    
     /// Generate an image from the video to show as thumbnail
     ///
     /// - Parameters:
@@ -221,7 +358,26 @@ public class VideoBackground {
         if let playerItemDidPlayToEndObserver = playerItemDidPlayToEndObserver {
             NotificationCenter.default.removeObserver(playerItemDidPlayToEndObserver)
         }
+        videoWillFinishedPlaying = nil
+//        playerStatus = nil
+//        playerItemPlayed = nil
+        NotificationCenter.default.removeObserver(self)
+//        playerItemDidPlay?.invalidate()
         viewBoundsObserver?.invalidate()
+        self.audioQueueObserver?.invalidate()
+        self.audioQueueObserver = nil
+        self.audioQueueStatusObserver?.invalidate()
+        self.audioQueueStatusObserver = nil
+        self.audioQueueBufferEmptyObserver?.invalidate()
+        self.audioQueueBufferEmptyObserver = nil
+        self.audioQueueBufferAlmostThereObserver?.invalidate()
+        self.audioQueueBufferAlmostThereObserver = nil
+        self.audioQueueBufferFullObserver?.invalidate()
+        self.audioQueueBufferFullObserver = nil
+        self.audioQueueStallObserver?.invalidate()
+        self.audioQueueStallObserver = nil
+        self.audioQueueWaitingObserver?.invalidate()
+        self.audioQueueWaitingObserver = nil
     }
 
     deinit {
